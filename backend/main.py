@@ -16,7 +16,8 @@ from . import models
 Base.metadata.create_all(bind=engine)
 
 # --- CONFIGURATION ---
-SECRET_KEY = "your_super_secret_key_change_in_production"
+import os
+SECRET_KEY = os.getenv("SECRET_KEY", "your_super_secret_key_change_in_production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 

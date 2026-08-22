@@ -1,5 +1,11 @@
 venv/
-**pycache**/
+.venv/
+__pycache__/
+**/*__pycache__*
 *.pyc
 .DS_Store
 .env
+*.db
+backend/data/*.db
+data/*.csv
+data/*.bak
