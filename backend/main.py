@@ -19,6 +19,7 @@ from sqlalchemy import func
 from pydantic import BaseModel
 from jose import JWTError, jwt
 import bcrypt
+import secrets
 import string
 import random
 import logging
@@ -35,7 +36,18 @@ logger = logging.getLogger(__name__)
 Base.metadata.create_all(bind=engine)
 run_schema_migrations()  # additive, idempotent; no-op on fresh databases
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your_super_secret_key_change_in_production")
+# JWT signing key. Never fall back to a publicly-known constant: if
+# SECRET_KEY is not provided we use an ephemeral random key, which is secure
+# but invalidates tokens on restart — a loud signal that SECRET_KEY must be
+# set in every real deployment (see .env.example).
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_urlsafe(48)
+    logger.warning(
+        "SECRET_KEY is not set — generated an ephemeral random signing key. "
+        "Logins will not survive a restart. Set SECRET_KEY in the environment "
+        "for all deployments (see .env.example)."
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -49,7 +61,12 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except ValueError:
+        # Malformed / non-bcrypt stored hash (legacy or corrupt data): never
+        # authenticate against it instead of crashing with a 500.
+        return False
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -138,9 +155,11 @@ def join_family(request: JoinFamilyRequest, db: Session = Depends(get_db)):
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
+        # Generic message for both cases so login never reveals whether a
+        # username exists.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
+            detail="Invalid username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = create_access_token(data={"sub": user.username, "groupId": user.group_code})

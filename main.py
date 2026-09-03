@@ -75,6 +75,27 @@ if "logged_in" not in st.session_state:
 # AUTH SCREEN
 # -----------------------------------
 
+def _complete_login(username: str, password: str, fallback_code: str = "") -> str:
+    """
+    Call the backend /login endpoint and, only on success, populate the JWT
+    session state. Never logs in without a valid token.
+
+    Returns "ok" (logged in), "bad" (invalid credentials), or "down"
+    (backend unreachable).
+    """
+    resp = api_client.login(username, password)
+    if resp is None:
+        return "down"
+    if resp.status_code == 200:
+        data = resp.json()
+        st.session_state.token = data.get("access_token", "")
+        st.session_state.group_code = data.get("group_code") or fallback_code
+        st.session_state.user_name = username
+        st.session_state.logged_in = True
+        return "ok"
+    return "bad"
+
+
 if not st.session_state.logged_in:
 
     st.subheader("👨‍👩‍👧‍👦 Welcome")
@@ -82,60 +103,89 @@ if not st.session_state.logged_in:
     auth_mode = st.radio(
         "Choose an option",
         [
-            "Create Family",
-            "Join Family"
+            "🏠 Create Family",
+            "🚪 Join Family (new member)",
+            "🔐 Log In"
         ]
     )
 
     # -----------------------------------
-    # CREATE FAMILY
+    # CREATE FAMILY (register a new family)
     # -----------------------------------
 
-    if auth_mode == "Create Family":
+    if auth_mode == "🏠 Create Family":
         family_name = st.text_input("Family Name")
         creator_name = st.text_input("Your Name")
         password = st.text_input("Password", type="password")
         if st.button("🏠 Create Family"):
             if family_name and creator_name and password:
-                # Create family via backend
                 resp = api_client.create_family(family_name, creator_name, password)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    code = data["group_code"]
-                    # Login to obtain JWT token
-                    login_resp = api_client.login(creator_name, password)
-                    if login_resp.status_code == 200:
-                        st.session_state.token = login_resp.json()["access_token"]
-                    st.session_state.logged_in = True
-                    st.session_state.group_code = code
-                    st.session_state.user_name = creator_name
-                    st.success(f"✅ Family created! Your group code is: {code}")
-                    st.rerun()
+                if resp is None:
+                    st.error("Cannot reach the server. Please try again.")
+                elif resp.status_code == 200:
+                    code = resp.json()["group_code"]
+                    if _complete_login(creator_name, password, fallback_code=code) == "ok":
+                        st.success(f"✅ Family created! Your group code is: {code}")
+                        st.rerun()
+                    else:
+                        st.success(f"✅ Family created! Your group code is: {code}")
+                        st.info("Your account is ready — use 🔐 Log In to enter.")
                 else:
-                    st.error(f"Error: {resp.json().get('detail', 'Failed to create family')}")
+                    st.error(resp.json().get("detail", "Failed to create family"))
             else:
                 st.error("Please fill all fields.")
-    else:
+
+    # -----------------------------------
+    # JOIN FAMILY (register a NEW account)
+    # -----------------------------------
+
+    elif auth_mode == "🚪 Join Family (new member)":
+        st.caption("Joining creates a new account for your family. Already registered? Use 🔐 Log In.")
         join_code = st.text_input("Enter Family Code")
         join_user = st.text_input("Your Name")
         password = st.text_input("Password", type="password")
         if st.button("🚪 Join Family"):
             if join_code and join_user and password:
                 resp = api_client.join_family(join_code, join_user, password)
-                if resp.status_code == 200:
-                    # Login to obtain JWT token
-                    login_resp = api_client.login(join_user, password)
-                    if login_resp.status_code == 200:
-                        st.session_state.token = login_resp.json()["access_token"]
-                    st.session_state.logged_in = True
-                    st.session_state.group_code = join_code
-                    st.session_state.user_name = join_user
-                    st.success("✅ Joined family successfully")
-                    st.rerun()
+                if resp is None:
+                    st.error("Cannot reach the server. Please try again.")
+                elif resp.status_code == 200:
+                    if _complete_login(join_user, password, fallback_code=join_code) == "ok":
+                        st.success("✅ Joined family successfully")
+                        st.rerun()
+                    else:
+                        st.success("✅ Your account was created.")
+                        st.info("Use 🔐 Log In to enter.")
                 else:
-                    st.error(resp.json().get("detail", "Invalid family code or username taken"))
+                    detail = resp.json().get("detail", "Invalid family code or username taken")
+                    if detail == "Username already taken":
+                        st.error("Username already taken — if you already have an account, use 🔐 Log In instead.")
+                    else:
+                        st.error(detail)
             else:
                 st.error("Please fill all fields.")
+
+    # -----------------------------------
+    # LOG IN (existing account only)
+    # -----------------------------------
+
+    else:
+        login_user = st.text_input("Username")
+        login_password = st.text_input("Password", type="password")
+        if st.button("🔐 Log In"):
+            if login_user and login_password:
+                status = _complete_login(login_user, login_password)
+                if status == "ok":
+                    st.success(f"✅ Welcome back, {login_user}!")
+                    st.rerun()
+                elif status == "down":
+                    st.error("Cannot reach the server. Please try again.")
+                else:
+                    # Generic on purpose: never reveals whether a username
+                    # exists and never reports "username already taken".
+                    st.error("Invalid username or password")
+            else:
+                st.error("Please fill in both username and password.")
     st.stop()
 
 # -----------------------------------
@@ -164,6 +214,9 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🚪 Logout"):
 
     st.session_state.logged_in = False
+    st.session_state.token = ""
+    st.session_state.pop("user_name", None)
+    st.session_state.pop("group_code", None)
 
     st.rerun()
 
