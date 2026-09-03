@@ -392,7 +392,10 @@ def test_ratings_persist_through_save_data(client):
 
     loaded = dbmod.load_data(f"ratings_{code}.csv")
     assert len(loaded) == 1  # no duplicate rows
-    assert float(loaded.iloc[0]["rating"]) == 5.0
+    # Re-rating updates the same row via the EMA policy (BETA = 0.5), so the
+    # stored value converges toward the new feedback instead of replacing it:
+    # 0.5*5.0 + 0.5*4.0 = 4.5. Week/day/comment still track the submission.
+    assert float(loaded.iloc[0]["rating"]) == 4.5
     assert loaded.iloc[0]["comment"] == "Even better second time"
     assert int(loaded.iloc[0]["week"]) == 2
     assert loaded.iloc[0]["day"] == "Tuesday"

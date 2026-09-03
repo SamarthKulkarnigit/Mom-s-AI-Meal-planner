@@ -71,3 +71,12 @@ def generate_schedule(group_code: str):
         headers=get_headers(),
     )
 
+
+def replace_day(group_code: str, week: int, day: str):
+    """POST /group/{group_code}/schedule/replace — replace ONE day of the saved plan."""
+    return _safe_post(
+        f"{API_URL}/group/{group_code}/schedule/replace",
+        headers=get_headers(),
+        json={"week": int(week), "day": day},
+    )
+

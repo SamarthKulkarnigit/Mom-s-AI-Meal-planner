@@ -224,6 +224,65 @@ def meal_scheduler_ui(group_code):
     if schedule_df is not None and not schedule_df.empty:
         st.markdown(f"**Saved plan for week {current_week}:**")
         st.dataframe(schedule_df, width="stretch")
+
+        # -----------------------------
+        # REPLACE A SINGLE DAY  (other six days stay untouched)
+        # -----------------------------
+        st.markdown("### 🔄 Replace a Single Day")
+        st.caption(
+            "Swap one meal without regenerating the week. "
+            "The recommendation engine finds grounded candidates and AI explains the pick."
+        )
+
+        plan_days = schedule_df["Day"].astype(str).tolist() if "Day" in schedule_df.columns else []
+        replace_result = None
+        for day in plan_days:
+            col_day, col_btn = st.columns([3, 1])
+            with col_day:
+                st.markdown(f"**{day}**")
+            with col_btn:
+                if st.button(
+                    f"Replace {day}",
+                    key=f"replace_{group_code}_{current_week}_{day}",
+                    use_container_width=True,
+                ):
+                    with st.spinner(f"Replacing {day}…"):
+                        try:
+                            replace_result = api_client.replace_day(group_code, current_week, day)
+                        except Exception as exc:
+                            st.error(f"Could not reach the backend: {exc}")
+                            replace_result = None
+
+        if replace_result is not None:
+            if replace_result.status_code == 200:
+                data = replace_result.json()
+                new_day = data.get("day", "?")
+                new_dish = data.get("dish_name", "?")
+                new_reason = data.get("reason", "") or ""
+                if data.get("fallback_used"):
+                    st.warning("⚠️ AI selection is temporarily unavailable — chose the top recommended dish instead.")
+                else:
+                    st.success(f"✅ {new_day} replaced with {new_dish}!")
+                st.markdown(f"**{new_day}: {new_dish}**")
+                if new_reason:
+                    st.caption(f"💡 *{new_reason}*")
+                # Refresh the displayed plan (only that day changed server-side).
+                fresh = db.load_data(_schedule_file(group_code, current_week))
+                if fresh is not None and not fresh.empty:
+                    st.markdown(f"**Updated plan for week {current_week}:**")
+                    st.dataframe(fresh, width="stretch")
+            elif replace_result.status_code == 403:
+                st.error("❌ You are not authorised to modify this group's plan.")
+            elif replace_result.status_code == 422:
+                detail = replace_result.json().get("detail", "Unknown error")
+                st.warning(f"⚠️ {detail}")
+            else:
+                detail = ""
+                try:
+                    detail = replace_result.json().get("detail", replace_result.text[:200])
+                except Exception:
+                    detail = replace_result.text[:200]
+                st.error(f"❌ Replace failed (HTTP {replace_result.status_code}): {detail}")
     else:
         st.info(f"No saved plan for week {current_week} yet.")
 

@@ -46,6 +46,30 @@ TIME_DECAY_ALPHA = 0.8
 # closer to 1.0 = slower forgetting
 # smaller = faster adaptation
 
+# ---------- recent-repetition / fatigue penalty ----------
+# A dish the group was served recently is demoted (softly) so the planner does
+# not over-serve the same highly rated favorites week after week. The penalty is
+# multiplicative on the hybrid score, capped, and decays with how long ago the
+# dish was served, so it can never overwhelm the learned personalization
+# signals and a genuinely preferred recent dish can still rank competitively.
+FATIGUE_PENALTY_MAX = 0.25          # strongest relative cut (most recent saved week)
+FATIGUE_PENALTY_DECAY = 0.5         # each older week halves the penalty
+FATIGUE_PENALTY_HORIZON_WEEKS = 5   # older than this: no penalty at all
+
+# ---------- controlled exploration ----------
+# The personalized path (A-Res over the top-k pool) is a closed set: once
+# dishes accumulate rating signal they fill the top-k, and dishes outside it
+# have no viable path into the plan. Exploration therefore reserves at most one
+# of the seven weekly slots for the strongest eligible dish that did NOT make
+# the pool. Selection is deterministic (no RNG) and bounded: it only ever
+# displaces the plan's weakest member, and only when that member is not
+# strongly more relevant than the candidate (ratio guard), so a genuinely
+# highly relevant personalized dish is never pushed out just to try something
+# new. When no group plan history exists yet (cold start) every dish is equally
+# "new", nothing is locked, and exploration is skipped entirely.
+EXPLORATION_MAX_SLOTS = 1            # at most one of the seven slots
+EXPLORATION_MIN_SCORE_RATIO = 0.5    # candidate >= 50% of displaced dish's final_score
+
 def _compute_time_weighted_ratings(ratings_df):
     """
     Computes time-weighted average ratings.
@@ -90,6 +114,176 @@ def _compute_time_weighted_ratings(ratings_df):
 def _log(*args):
     # print to stderr so Streamlit UI doesn't swallow it
     print(*args, file=sys.stderr)
+
+# ---------- recent serving history (fatigue penalty input) ----------
+def _serving_fatigue_factor(group_code: str) -> dict:
+    """
+    Deterministic, bounded recency penalty derived from the existing saved-plan
+    history (ScheduleEntry rows — no new persistence mechanism).
+
+    For each dish, age = (latest saved-plan week for the group) - (the week the
+    dish last appeared in a saved plan). A dish in the most recent saved plan
+    has age 0 and receives the strongest penalty; each older week halves the
+    penalty; dishes older than FATIGUE_PENALTY_HORIZON_WEEKS (or with no
+    serving history at all) receive none.
+
+    Returns {dish_name: multiplicative_factor} with factors in
+    (1 - FATIGUE_PENALTY_MAX, 1.0]. Dishes absent from the dict (no history,
+    or beyond the horizon) must be treated by the caller as factor 1.0 — this
+    keeps cold-start behaviour unchanged when no plan history exists.
+    """
+    from backend.database import SessionLocal
+    from backend import models as _models
+
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(_models.ScheduleEntry.week, _models.Dish.name)
+            .join(_models.Dish, _models.ScheduleEntry.dish_id == _models.Dish.id)
+            .filter(_models.ScheduleEntry.group_code == group_code)
+            .all()
+        )
+    finally:
+        session.close()
+
+    if not rows:
+        return {}
+
+    latest_week = max(week for week, _ in rows)
+    last_seen_week = {}
+    for week, dish_name in rows:
+        if dish_name not in last_seen_week or week > last_seen_week[dish_name]:
+            last_seen_week[dish_name] = week
+
+    factors = {}
+    for dish_name, last_week in last_seen_week.items():
+        age = latest_week - last_week
+        if age < 0 or age > FATIGUE_PENALTY_HORIZON_WEEKS:
+            continue
+        penalty = FATIGUE_PENALTY_MAX * (FATIGUE_PENALTY_DECAY ** age)
+        factors[dish_name] = 1.0 - penalty
+    return factors
+
+# ---------- controlled exploration helpers ----------
+def _served_dishes_latest_week(group_code: str) -> set:
+    """
+    Names of the dishes in the group's most recent saved-plan week.
+
+    This is the "just served" set that exploration must not pick from: a dish
+    the group was served in the latest saved week is by definition the kind of
+    repetition the exploration slot exists to reduce. Empty when the group has
+    no saved plan at all (cold start).
+    """
+    from backend.database import SessionLocal
+    from backend import models as _models
+    from sqlalchemy import func
+
+    session = SessionLocal()
+    try:
+        latest = (
+            session.query(func.max(_models.ScheduleEntry.week))
+            .filter(_models.ScheduleEntry.group_code == group_code)
+            .scalar()
+        )
+        if latest is None:
+            return set()
+        rows = (
+            session.query(_models.Dish.name)
+            .join(_models.ScheduleEntry, _models.ScheduleEntry.dish_id == _models.Dish.id)
+            .filter(
+                _models.ScheduleEntry.group_code == group_code,
+                _models.ScheduleEntry.week == latest,
+            )
+            .all()
+        )
+        return {name for (name,) in rows}
+    finally:
+        session.close()
+
+
+def _pick_exploration_dish(
+    dish_stats,       # DataFrame sorted by final_score desc, has "dish"/"final_score"
+    top_k,            # size of the personalized pool (min(20, len(dish_stats)))
+    chosen,           # current personalized plan dish names (unique, len >= 2)
+    fatigue,          # dict from _serving_fatigue_factor
+    latest_served,    # set from _served_dishes_latest_week
+    content_sim,      # diagonal-zeroed content similarity frame
+    cf_sim,           # diagonal-zeroed collaborative-filtering similarity frame
+):
+    """
+    Deterministically pick at most one dish from OUTSIDE the top-k pool to swap
+    into the plan, or return None to keep the fully personalized 7 dishes.
+
+    Returns (exploration_dish, displaced_dish) or None.
+
+    Eligibility (all must hold):
+      - the group already has saved-plan history (cold start: nothing locked,
+        nothing to explore);
+      - the candidate ranks BELOW the top-k pool (the closed-set bottleneck);
+      - it was NOT served in the most recent saved-plan week, and when any
+        candidate has never been served within the fatigue horizon at all
+        (no fatigue factor / factor == 1.0), recently-served ones are ignored;
+      - it is not already in the plan;
+      - it satisfies the existing >= 0.9 pairwise similarity rule against the
+        six dishes that remain after the swap.
+
+    Ranking is deterministic and adds NO new scoring weights: among eligible
+    candidates it takes the highest existing final_score (hybrid x fatigue,
+    the same signal the personalized path ranks on), tie-broken by dish name.
+
+    Boundedness: the swap displaces only the plan's weakest member (lowest
+    final_score) and only when the candidate reaches at least
+    EXPLORATION_MIN_SCORE_RATIO of that member's score, so a strongly relevant
+    personalized dish is never overwritten by a merely-new one.
+    """
+    if not latest_served:
+        return None                       # no saved-plan history -> cold start
+    if top_k >= len(dish_stats):
+        return None                       # nothing exists outside the pool
+    if len(chosen) < 2:
+        return None
+    if not {"dish", "final_score"}.issubset(dish_stats.columns):
+        return None
+
+    outside = dish_stats.iloc[top_k:]     # rows ranked top_k+1 .. end
+    outside = outside[~outside["dish"].isin(chosen)]
+    if outside.empty:
+        return None
+
+    # never served in the most recent saved-plan week
+    not_just_served = outside[~outside["dish"].isin(latest_served)]
+    if not_just_served.empty:
+        return None                       # every outside dish was just served
+    # prefer candidates with no recency penalty at all (never served within the
+    # fatigue horizon); fall back to the not-just-served set otherwise
+    clean = not_just_served[not_just_served["dish"].map(lambda d: fatigue.get(d, 1.0) == 1.0)]
+    eligible = clean if not clean.empty else not_just_served
+    if eligible.empty:
+        return None
+
+    score_of = dish_stats.set_index("dish")["final_score"]
+    weakest_name = min(chosen, key=lambda d: score_of.get(d, 0.0))
+    weakest_score = float(score_of.get(weakest_name, 0.0))
+    others = [d for d in chosen if d != weakest_name]
+
+    def _too_similar(dish, other):
+        sim_cf = cf_sim.loc[dish, other] if (not cf_sim.empty and dish in cf_sim.index and other in cf_sim.columns) else 0.0
+        sim_cc = content_sim.loc[dish, other] if (not content_sim.empty and dish in content_sim.index and other in content_sim.columns) else 0.0
+        return max(sim_cf, sim_cc) >= 0.9
+
+    # deterministic argmax by (final_score desc, dish name asc); the ratio
+    # guard is monotone in candidate score, so the first candidate that fails
+    # it means every weaker one fails too -> no exploration this round.
+    ranked = eligible.sort_values(["final_score", "dish"], ascending=[False, True])
+    for _, row in ranked.iterrows():
+        cand = str(row["dish"])
+        cand_score = float(row["final_score"])
+        if weakest_score > 0 and cand_score < EXPLORATION_MIN_SCORE_RATIO * weakest_score:
+            return None
+        if any(_too_similar(cand, o) for o in others):
+            continue
+        return cand, weakest_name
+    return None
 
 # ---------- loaders ----------
 def _load_clean_data(group_code: str):
@@ -224,7 +418,13 @@ def _build_content_sim(dishes: pd.DataFrame):
     try:
         tfidf = TfidfVectorizer()
         mat = tfidf.fit_transform(texts)
-        sim = cosine_similarity(mat)
+        sim = np.array(cosine_similarity(mat), copy=True)  # ensure writable
+        # A dish's similarity to ITSELF (diagonal = 1.0) must never feed its own
+        # score: downstream scoring takes the per-row max as "similarity to the
+        # most similar OTHER dish". Zeroing the diagonal keeps single-dish / tiny
+        # catalogs valid (max safely becomes 0). Pairwise entries used by the
+        # variety filter are unaffected (it only compares different dishes).
+        np.fill_diagonal(sim, 0.0)
         return pd.DataFrame(sim, index=dishes["dish"], columns=dishes["dish"])
     except Exception as e:
         _log("content sim error:", e)
@@ -235,7 +435,12 @@ def _build_cf_sim(ratings: pd.DataFrame):
     try:
         rm = ratings.pivot_table(index="user", columns="dish", values="rating", fill_value=0.0)
         if rm.empty: return pd.DataFrame()
-        sim = cosine_similarity(rm.T)
+        sim = np.array(cosine_similarity(rm.T), copy=True)  # ensure writable
+        # Same self-similarity fix as _build_content_sim: only similarity to
+        # OTHER rated dishes should count, so a dish that was rated but is
+        # unlike everything else no longer gets a free 1.0 from itself, and a
+        # single rated dish safely scores 0 instead of 1.
+        np.fill_diagonal(sim, 0.0)
         return pd.DataFrame(sim, index=rm.columns, columns=rm.columns)
     except Exception as e:
         _log("cf sim error:", e)
@@ -336,10 +541,18 @@ def generate_weekly_plan_for_group(group_code: str, n_days: int = 7, return_stat
         + 0.15 * dish_stats["content_score"]
     )
 
+    # --- soft recent-repetition / fatigue penalty (ScheduleEntry history) ---
+    # Scale the hybrid score down for dishes that were served to the group
+    # recently (see _serving_fatigue_factor). No history -> factor 1.0, so the
+    # cold-start behaviour is unchanged.
+    fatigue = _serving_fatigue_factor(group_code)
+    dish_stats["fatigue_factor"] = dish_stats["dish"].map(fatigue).fillna(1.0)
+    dish_stats["final_score"] = dish_stats["hybrid_score"] * dish_stats["fatigue_factor"]
+
     dish_stats = dish_stats.sort_values(
-    "hybrid_score",
-    ascending=False
-).reset_index(drop=True)
+        "final_score",
+        ascending=False
+    ).reset_index(drop=True)
 
     # --------------------------------
     # CONTROLLED RANDOMNESS
@@ -351,7 +564,7 @@ def generate_weekly_plan_for_group(group_code: str, n_days: int = 7, return_stat
 
     # weighted randomization
     # add an epsilon to ensure all probabilities are non-zero and well-behaved (prevents ValueError when replace=False in sample)
-    scores_epsilon = top_pool["hybrid_score"] + 0.1
+    scores_epsilon = top_pool["final_score"] + 0.1
     top_pool["probability"] = (
         scores_epsilon
         / scores_epsilon.sum()
@@ -396,6 +609,24 @@ def generate_weekly_plan_for_group(group_code: str, n_days: int = 7, return_stat
             if len(chosen) >= n_days: break
             if dname not in chosen:
                 chosen.append(dname)
+
+    # --------------------------------
+    # CONTROLLED EXPLORATION (bounded, at most one slot)
+    # --------------------------------
+    # The personalized path above only ever samples the top-k pool, so dishes
+    # outside it have no path into the plan once ratings lock the pool. Swap in
+    # the strongest eligible outside dish for the plan's weakest member when
+    # that cannot meaningfully hurt personalization (all guards live in
+    # _pick_exploration_dish). Cold start and ineligible cases are unchanged.
+    swap = _pick_exploration_dish(
+        dish_stats, top_k, chosen, fatigue,
+        _served_dishes_latest_week(group_code),
+        content_sim, cf_sim,
+    )
+    if swap is not None:
+        cand, displaced = swap
+        chosen[chosen.index(displaced)] = cand
+        _log("AI: exploration slot ->", cand, "(replacing", displaced + ")")
 
     days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
     plan = pd.DataFrame({"Day": days[:n_days], "Dish": chosen[:n_days]})

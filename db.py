@@ -14,6 +14,25 @@ from backend import models
 # idempotent; a no-op when the table does not exist yet.
 run_schema_migrations()
 
+# ---------------------------------------------------------------------------
+# RATING UPDATE POLICY (exponential moving average)
+# ---------------------------------------------------------------------------
+# Rating rows are unique on (group_code, dish_id, user_name), so re-rating the
+# same dish must update the single stored row rather than append history. A
+# plain overwrite lets one fresh submission erase all earlier evidence and lets
+# serving frequency (which is itself driven by the score) refresh a dish's
+# entire rating signal — an artificial positive-feedback loop.
+#
+# Instead, an update damps the stored value toward the new observation:
+#
+#     stored = BETA * fresh + (1 - BETA) * stored
+#
+# Repeated ratings therefore converge toward the member's repeated preference
+# (each exposure contributes) instead of replacing it with the last draw.
+# New ratings (no existing row) store the submitted value directly. The week /
+# day / comment fields still track the latest submission exactly as before.
+RATING_EMA_BETA = 0.5
+
 # -----------------------------------
 # COMPATIBILITY WRAPPERS
 # -----------------------------------
@@ -184,7 +203,10 @@ def save_data(df: pd.DataFrame, filename: str):
                         .first()
                     )
                     if existing:
-                        existing.rating = float(raw_rating)
+                        # EMA damped update (see RATING_EMA_BETA) — identical
+                        # semantics to db.rate_dish; week/day/comment still track
+                        # the latest submission.
+                        existing.rating = round(RATING_EMA_BETA * float(raw_rating) + (1.0 - RATING_EMA_BETA) * float(existing.rating), 2)
                         if week_int is not None:
                             existing.week = week_int
                         if day:
@@ -486,13 +508,16 @@ def rate_dish(group_code: str, dish: str, rating: float, user_name: str = "", we
         dish_obj = db.query(models.Dish).filter(models.Dish.group_code == group_code, models.Dish.name == dish_clean).first()
         if not dish_obj: return False
         
+        fresh = float(rating)
         if overwrite:
             existing = db.query(models.Rating).filter(models.Rating.group_code == group_code, models.Rating.dish_id == dish_obj.id, models.Rating.user_name == user_clean).first()
             if existing:
-                existing.rating = float(rating)
+                # EMA damped update (see RATING_EMA_BETA): converge toward the
+                # member's repeated preference instead of replacing it.
+                existing.rating = round(RATING_EMA_BETA * fresh + (1.0 - RATING_EMA_BETA) * float(existing.rating), 2)
                 existing.week = int(week) if week else existing.week
             else:
-                r = models.Rating(group_code=group_code, dish_id=dish_obj.id, user_name=user_clean, rating=float(rating), week=int(week) if week else 1)
+                r = models.Rating(group_code=group_code, dish_id=dish_obj.id, user_name=user_clean, rating=fresh, week=int(week) if week else 1)
                 db.add(r)
         else:
             r = models.Rating(group_code=group_code, dish_id=dish_obj.id, user_name=user_clean, rating=float(rating), week=int(week) if week else 1)

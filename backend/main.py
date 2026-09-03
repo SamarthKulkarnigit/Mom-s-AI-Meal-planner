@@ -116,6 +116,11 @@ class JoinFamilyRequest(BaseModel):
     password: str
 
 
+class ReplaceDayRequest(BaseModel):
+    week: int
+    day: str
+
+
 # ─── Core routes ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -378,6 +383,21 @@ def _fallback_plan_entries(group_code: str, db: Session) -> List[dict]:
     return entries
 
 
+def _deterministic_replace_selection(candidates: List[dict]) -> dict:
+    """
+    Deterministic fallback for replacing one day: pick the highest-ranked
+    eligible grounded candidate (candidates are already sorted by hybrid score)
+    and produce a grounded, deterministic reason from its own evidence.
+    """
+    cand = candidates[0]
+    evidence = cand.get("evidence") or []
+    if evidence:
+        reason = f"Chosen by the recommendation engine — {evidence[0]}."
+    else:
+        reason = "Chosen by the recommendation engine based on family preferences and variety."
+    return {"dish_id": cand["dish_id"], "reason": reason}
+
+
 def _persist_plan(group_code: str, week: int, plan_entries: List[dict], db: Session) -> None:
     """Atomically replace any existing schedule for (group, week) with the new plan."""
     db.query(models.ScheduleEntry).filter(
@@ -583,3 +603,185 @@ def get_group_schedule(
             for e in entries
         ],
     }
+
+
+@app.post("/group/{group_code}/schedule/replace")
+def replace_schedule_day(
+    group_code: str,
+    request: ReplaceDayRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Replace ONE day of a saved weekly plan without touching the other six days.
+
+    1. Auth: user must belong to the group.
+    2. Validate: the (week, day) row must exist, exactly once.
+    3. Candidates: grounded ML candidates, minus the 7 dishes already scheduled
+       that week (the current day's dish included).
+    4. LLM: Gemini picks one replacement and writes a grounded reason.
+    5. Validation: dish belongs to the group, was in the sent candidate set, is
+       not used by another day, reason non-empty.
+    6. Fallback: deterministic top-ranked eligible candidate on any failure.
+    7. Persistence: update ONLY that day's ScheduleEntry (dish_id + reason)
+       inside one transaction.
+    """
+    _ensure_group_access(current_user, group_code)
+
+    group = db.query(models.Group).filter(models.Group.group_code == group_code).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    if request.day not in VALID_DAYS:
+        raise HTTPException(status_code=422, detail=f"Invalid day '{request.day}'")
+
+    # Exactly one existing ScheduleEntry for (group, week, day) must be targeted.
+    entries = (
+        db.query(models.ScheduleEntry)
+        .filter(
+            models.ScheduleEntry.group_code == group_code,
+            models.ScheduleEntry.week == request.week,
+        )
+        .all()
+    )
+    if not entries:
+        raise HTTPException(status_code=404, detail=f"No saved plan found for week {request.week}")
+
+    targets = [e for e in entries if e.day == request.day]
+    if len(targets) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Expected exactly one ScheduleEntry for week {request.week} day {request.day}, found {len(targets)}",
+        )
+    target = targets[0]
+
+    current_dish_id = target.dish_id
+    other_entries = [e for e in entries if e.day != request.day]
+    used_dish_ids = {e.dish_id for e in entries}  # current day + the other six
+    other_dish_names = [
+        e.dish.name if e.dish else "Unknown" for e in sorted(other_entries, key=lambda e: VALID_DAYS.index(e.day))
+    ]
+
+    # 3. Grounded candidates, minus dishes already scheduled this week.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from ml_recommender import get_candidates_for_group
+        candidates = get_candidates_for_group(group_code, n_candidates=14)
+    except Exception as exc:
+        logger.error("SCHEDULE/REPLACE: candidate generation error: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Recommendation engine error: {exc}")
+
+    eligible = [c for c in candidates if c["dish_id"] not in used_dish_ids]
+    if not eligible:
+        raise HTTPException(
+            status_code=422,
+            detail="No candidate dish is available to replace this day. Suggest more dishes via the Polls page.",
+        )
+
+    eligible_ids = {c["dish_id"] for c in eligible}
+    group_dish_ids = {d.id for d in db.query(models.Dish).filter(models.Dish.group_code == group_code).all()}
+
+    family_context = {
+        "family_name": group.family_name,
+        "members": [u.username for u in db.query(models.User).filter(models.User.group_code == group_code).all()],
+    }
+
+    # 4-6. Gemini path with deterministic fallback.
+    ai_generated = True
+    fallback_reason: Optional[str] = None
+    dish_id: Optional[int] = None
+    reason: Optional[str] = None
+
+    try:
+        from .llm_service import replace_day_plan as llm_replace, LLMServiceError
+        raw = llm_replace(
+            eligible,
+            day=request.day,
+            current_dish_name=target.dish.name if target.dish else "Unknown",
+            other_dish_names=other_dish_names,
+            family_context=family_context,
+        )
+
+        if not isinstance(raw, dict):
+            raise ValueError("Gemini replace response is not an object")
+        missing = [k for k in ("dish_id", "reason") if k not in raw]
+        if missing:
+            raise ValueError(f"Gemini replace response missing keys: {missing}")
+
+        try:
+            candidate_dish_id = int(raw["dish_id"])
+        except (TypeError, ValueError):
+            raise ValueError(f"dish_id '{raw['dish_id']}' is not an integer")
+
+        if candidate_dish_id not in group_dish_ids:
+            raise ValueError(f"dish_id={candidate_dish_id} does not belong to this group")
+        if candidate_dish_id not in eligible_ids:
+            raise ValueError(f"dish_id={candidate_dish_id} was not in the eligible candidate set")
+        if candidate_dish_id in used_dish_ids:
+            raise ValueError(f"dish_id={candidate_dish_id} is already scheduled this week")
+
+        candidate_reason = str(raw.get("reason", "")).strip()
+        if len(candidate_reason) < 5:
+            raise ValueError("reason is too short")
+
+        dish_id = candidate_dish_id
+        reason = candidate_reason
+
+    except Exception as exc:
+        logger.warning(
+            "SCHEDULE/REPLACE: AI path failed (%s: %s) — using ML fallback",
+            type(exc).__name__, exc,
+        )
+        ai_generated = False
+        fallback_reason = str(exc)
+        selection = _deterministic_replace_selection(eligible)
+        dish_id = selection["dish_id"]
+        reason = selection["reason"]
+
+    # 7. Persist: only the targeted day's row, in one transaction.
+    try:
+        target.dish_id = dish_id
+        target.reason = reason
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("SCHEDULE/REPLACE: persistence failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not persist the replacement")
+
+    # Return the updated week in Monday-Sunday order (same convention as /generate).
+    updated_entries = (
+        db.query(models.ScheduleEntry)
+        .filter(
+            models.ScheduleEntry.group_code == group_code,
+            models.ScheduleEntry.week == request.week,
+        )
+        .all()
+    )
+    updated_entries.sort(key=lambda e: VALID_DAYS.index(e.day))
+
+    dish_id_to_name = {c["dish_id"]: c["dish_name"] for c in candidates}
+    response = {
+        "week": request.week,
+        "day": request.day,
+        "ai_generated": ai_generated,
+        "fallback_used": not ai_generated,
+        "dish_id": dish_id,
+        "dish_name": dish_id_to_name.get(dish_id, target.dish.name if target.dish else ""),
+        "reason": reason,
+        "schedule": [
+            {
+                "day": e.day,
+                "dish_id": e.dish_id,
+                "dish_name": e.dish.name if e.dish else "",
+                "reason": e.reason,
+            }
+            for e in updated_entries
+        ],
+    }
+    if fallback_reason:
+        response["fallback_notice"] = (
+            "AI selection is temporarily unavailable. "
+            "We chose the top recommended dish instead."
+        )
+
+    return response
