@@ -1,7 +1,10 @@
+import os
 import streamlit as st
 import requests
 
-API_URL = "http://127.0.0.1:8000"
+# Environment-driven backend URL. Localhost is only the development fallback;
+# production deployments set API_URL to the deployed FastAPI service (Render).
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
 
 def get_headers():
     headers = {}
@@ -57,4 +60,14 @@ def get_dishes(group_code):
     return _safe_get(f"{API_URL}/dishes/{group_code}", headers=get_headers())
 
 def get_schedule(group_code):
-    return _safe_get(f"{API_URL}/schedule/{group_code}", headers=get_headers())
+    """GET /group/{group_code}/schedule — current (latest) saved plan with reasons."""
+    return _safe_get(f"{API_URL}/group/{group_code}/schedule", headers=get_headers())
+
+
+def generate_schedule(group_code: str):
+    """POST /group/{group_code}/schedule/generate — AI-assisted plan generation."""
+    return _safe_post(
+        f"{API_URL}/group/{group_code}/schedule/generate",
+        headers=get_headers(),
+    )
+

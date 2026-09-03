@@ -80,11 +80,15 @@ def poll_ui(group_code: str, user_name: str):
                         use_container_width=True
                     ):
                         try:
-                            db.vote_dish(group_code, dish, user_name)
-                            st.success(f"Vote registered for {dish}!")
-                            st.rerun()
+                            ok = db.vote_dish(group_code, dish, user_name)
                         except Exception as e:
+                            ok = False
                             st.error(f"Voting failed: {e}")
+                        if ok:
+                            st.success(f"Vote registered for {dish}!")
+                        else:
+                            st.error(f"Could not register vote for {dish}. Please try again.")
+                        st.rerun()
                             
                 with col_metric:
                     st.caption(f"Status: {'✅ Promoted!' if votes >= majority_needed else '⏳ Pending votes...'}")

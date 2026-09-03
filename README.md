@@ -19,13 +19,13 @@ The application is modularized to separate the frontend UI from the backend busi
 ```
 [ Frontend (Streamlit) ]
          |
-    (api_client.py)
+    (db.py / api_client.py)
          |
          v
-[ Backend API (FastAPI) ]
+[ Backend API (FastAPI) & SQLAlchemy ]
          |
          v
-[ Data Layer (SQLite & CSVs) ]
+[ Unified Data Layer (SQLite / PostgreSQL) ]
 ```
 
 ### Tech Stack
@@ -33,7 +33,7 @@ The application is modularized to separate the frontend UI from the backend busi
 - **Frontend**: Streamlit, Pandas, Plotly
 - **Backend**: FastAPI, Uvicorn, SQLAlchemy, Pydantic
 - **Machine Learning**: scikit-learn (TF-IDF, Cosine Similarity)
-- **Data Persistence**: SQLite (for User/Group auth) + CSV (for ratings, polls, and schedules)
+- **Data Persistence**: Unified SQLAlchemy models backed by SQLite (local) or PostgreSQL (production)
 
 ## Recommendation System
 
@@ -63,22 +63,36 @@ pip install -r requirements.txt
 ```
 
 ### 3. Environment Variables
-Copy the example environment file and update it if necessary:
-```bash
-cp .env.example .env
-```
-Ensure `SECRET_KEY` is set in the `.env` file for secure session management.
+You can configure the application database connection via the `DATABASE_URL` environment variable. By default, it will use a local SQLite file.
 
-### 4. Start the Backend API (Terminal 1)
+For local development (default):
+```bash
+export DATABASE_URL="sqlite:///./backend/data/mealplanner.db"
+```
+
+For production (PostgreSQL):
+```bash
+export DATABASE_URL="postgresql://user:password@host:port/dbname"
+```
+Ensure `SECRET_KEY` is also set in the `.env` file for secure session management.
+
+### 4. Data Migration (Important for Phase 1)
+If you have legacy CSV data in the `data/` folder, migrate it to the new SQL database using the migration utility:
+```bash
+python scripts/migrate_csv_to_sql.py
+```
+This script safely parses all CSV files and inserts them into the SQLAlchemy database. It is idempotent and safe to run multiple times.
+
+### 5. Start the Backend API (Terminal 1)
 ```bash
 uvicorn backend.main:app --reload
 ```
-The backend will automatically initialize the `mealplanner.db` database and run on `http://127.0.0.1:8000`.
+The backend will automatically initialize the database and run on `http://127.0.0.1:8000`.
 
-### 5. Start the Frontend Application (Terminal 2)
+### 6. Start the Frontend Application (Terminal 2)
 Open a new terminal, activate the virtual environment, and run:
 ```bash
-streamlit run main.py
+PYTHONPATH=. streamlit run main.py
 ```
 The application will be accessible at `http://localhost:8501`.
 
@@ -86,8 +100,8 @@ The application will be accessible at `http://localhost:8501`.
 > *Placeholder for application screenshots (e.g., Home Dashboard, Scheduler, Analytics).*
 
 ## Design Decisions
+- **Unified Persistence Layer**: All data (Users, Groups, Dishes, Ratings, Polls, Schedules) has been migrated from CSVs to a cloud-ready SQL database using SQLAlchemy. `db.py` acts as a compatibility wrapper that directly queries the database and returns Pandas DataFrames, preventing unnecessary rewrites of the ML algorithms or UI components.
 - **API Layer**: An API layer was introduced so the Streamlit frontend remains stateless and can easily be replaced or supplemented by mobile clients in the future.
-- **Hybrid Persistence**: SQLite handles secure relational data (Users, Groups, Passwords) via SQLAlchemy, while Pandas/CSV handles time-series and log data (ratings, polls) for rapid prototyping and easy data inspection.
 - **A-Res Sampling**: Chosen for the recommendation engine to provide a mathematically sound way of randomizing selections while still strongly favoring highly-rated dishes.
 
 ## Future Improvements

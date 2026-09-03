@@ -403,3 +403,137 @@ def generate_weekly_plan_for_group(group_code: str, n_days: int = 7, return_stat
     if return_stats:
         return plan, dish_stats
     return plan
+
+
+# ---------- candidate export for Gemini ----------
+def get_candidates_for_group(group_code: str, n_candidates: int = 14) -> list:
+    """
+    Return the top n_candidates ranked meals for a group as structured dicts
+    suitable for passing to the LLM service.
+
+    Each dict:
+    {
+        "dish_id":              int,   # DB ID
+        "dish_name":            str,
+        "recommendation_score": float, # hybrid 0-1
+        "evidence":             list[str]  # grounded factual signals
+    }
+
+    Reuses the existing scoring pipeline — no duplicate math.
+    Returns [] if insufficient data.
+    """
+    import db as _db
+
+    _log(f"CANDIDATES: get_candidates_for_group({group_code}, n={n_candidates})")
+    ratings, polls, dishes, group_df = _load_clean_data(group_code)
+
+    if dishes is None or dishes.empty:
+        _log("CANDIDATES: no dishes — returning empty")
+        return []
+
+    # --- time-decayed rating stats ---
+    if ratings is None or ratings.empty:
+        rating_stats = pd.DataFrame(columns=["dish", "avg_rating", "n_ratings"])
+    else:
+        week_col = next((c for c in ratings.columns if c.lower().strip() == "week"), None)
+        if week_col is None:
+            rating_stats = ratings.groupby("dish").agg(
+                avg_rating=("rating", "mean"),
+                n_ratings=("rating", "count"),
+            ).reset_index()
+        else:
+            ratings = ratings.copy()
+            ratings["week_numeric"] = pd.to_numeric(ratings[week_col], errors="coerce").fillna(0).astype(int)
+            max_w = ratings["week_numeric"].max()
+            ratings["weight"] = 0.8 ** (max_w - ratings["week_numeric"])
+            rating_stats = ratings.groupby("dish").apply(
+                lambda g: pd.Series({
+                    "avg_rating": np.average(g["rating"], weights=g["weight"]),
+                    "n_ratings": len(g),
+                })
+            ).reset_index()
+
+    dish_stats = dishes[["dish"]].drop_duplicates().copy()
+    try:
+        dish_stats = (
+            dish_stats
+            .merge(rating_stats, on="dish", how="left")
+            .merge(polls[["dish", "votes"]], on="dish", how="left")
+        )
+    except Exception:
+        if "avg_rating" not in dish_stats.columns:
+            dish_stats["avg_rating"] = 0.0
+        if "n_ratings" not in dish_stats.columns:
+            dish_stats["n_ratings"] = 0.0
+        if "votes" not in dish_stats.columns:
+            dish_stats["votes"] = 0.0
+
+    dish_stats["avg_rating"] = pd.to_numeric(dish_stats.get("avg_rating", 0), errors="coerce").fillna(0.0)
+    dish_stats["votes"] = pd.to_numeric(dish_stats.get("votes", 0), errors="coerce").fillna(0.0)
+
+    content_sim = _build_content_sim(dishes)
+    cf_sim = _build_cf_sim(ratings)
+
+    dish_stats["rating_score"] = _norm(dish_stats["avg_rating"])
+    dish_stats["popularity_score"] = _norm(dish_stats["votes"])
+
+    cf_scores, content_scores = [], []
+    for dish in dish_stats["dish"].tolist():
+        cf = float(cf_sim.loc[dish].max()) if (not cf_sim.empty and dish in cf_sim.index) else 0.0
+        ct = float(content_sim.loc[dish].max()) if (not content_sim.empty and dish in content_sim.index) else 0.0
+        cf_scores.append(cf)
+        content_scores.append(ct)
+
+    dish_stats["cf_score"] = _norm(pd.Series(cf_scores))
+    dish_stats["content_score"] = _norm(pd.Series(content_scores))
+
+    dish_stats["hybrid_score"] = (
+        0.40 * dish_stats["rating_score"]
+        + 0.25 * dish_stats["popularity_score"]
+        + 0.20 * dish_stats["cf_score"]
+        + 0.15 * dish_stats["content_score"]
+    )
+
+    dish_stats = dish_stats.sort_values("hybrid_score", ascending=False).reset_index(drop=True)
+    top = dish_stats.head(n_candidates)
+
+    # --- fetch dish IDs from SQLAlchemy (needed for validation) ---
+    try:
+        from backend.database import SessionLocal
+        from backend import models as _models
+        db_sess = SessionLocal()
+        dish_id_map = {
+            d.name.lower(): d.id
+            for d in db_sess.query(_models.Dish).filter(_models.Dish.group_code == group_code).all()
+        }
+        db_sess.close()
+    except Exception as e:
+        _log("CANDIDATES: could not load dish IDs from DB:", e)
+        dish_id_map = {}
+
+    candidates = []
+    for _, row in top.iterrows():
+        dish_name = str(row["dish"])
+        dish_id = dish_id_map.get(dish_name.lower())
+        if dish_id is None:
+            continue  # skip dishes not in DB — safety filter
+
+        evidence = []
+        if float(row.get("rating_score", 0)) > 0.5:
+            evidence.append("high family rating")
+        if float(row.get("popularity_score", 0)) > 0.5:
+            evidence.append("highly voted in polls")
+        if float(row.get("cf_score", 0)) > 0.5:
+            evidence.append("matches preferences of similar family members")
+        if not evidence:
+            evidence.append("adds variety to the weekly rotation")
+
+        candidates.append({
+            "dish_id": dish_id,
+            "dish_name": dish_name,
+            "recommendation_score": round(float(row["hybrid_score"]), 4),
+            "evidence": evidence,
+        })
+
+    _log(f"CANDIDATES: returning {len(candidates)} candidates")
+    return candidates

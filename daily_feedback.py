@@ -2,41 +2,26 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import db
-import os
 
 def daily_feedback_ui(group_code, user_name):
     st.subheader("💬 Daily Meal Feedback")
 
     # ----------------------------------------
-    # DYNAMIC WEEK SELECTOR
+    # DYNAMIC WEEK SELECTOR  (DB-backed)
     # ----------------------------------------
     active_week = db.get_current_active_week(group_code)
-    
-    # List all available weeks that have schedules
-    try:
-        files = os.listdir("data")
-    except Exception:
-        files = []
-    
-    prefix = f"schedule_{group_code}_week"
-    available_weeks = []
-    for f in files:
-        if f.startswith(prefix) and f.endswith(".csv"):
-            try:
-                available_weeks.append(int(f[len(prefix):-4]))
-            except ValueError:
-                pass
-    available_weeks = sorted(list(set(available_weeks)))
-    
+
+    # All weeks that have saved schedule rows (from the database, not files)
+    available_weeks = db.get_plan_weeks(group_code)
     if not available_weeks:
         available_weeks = [1]
-        
+
     default_index = 0
     if active_week in available_weeks:
         default_index = available_weeks.index(active_week)
     else:
         default_index = len(available_weeks) - 1
-        
+
     current_week = st.selectbox(
         "📅 Select Week to View/Rate",
         available_weeks,

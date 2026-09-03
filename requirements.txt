@@ -13,3 +13,9 @@ python-jose
 bcrypt
 passlib
 python-multipart
+psycopg2-binary
+google-genai
+
+# Testing
+pytest
+httpx
