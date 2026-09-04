@@ -97,6 +97,11 @@ class ServedLog(Base):
     dish_id = Column(Integer, ForeignKey("dishes.id"))
     day = Column(String, nullable=False)
     week = Column(Integer, nullable=False)
+    # ORM relationship only (no schema change): lets code resolve the served
+    # dish name via sl.dish.name, matching the convention used by ScheduleEntry,
+    # Rating, and PollOption. Previously only dish_id existed, so any code path
+    # that accessed sl.dish raised AttributeError.
+    dish = relationship("Dish")
 
 # ScheduleEntry model (Maps to schedule_{code}*.csv)
 class ScheduleEntry(Base):
