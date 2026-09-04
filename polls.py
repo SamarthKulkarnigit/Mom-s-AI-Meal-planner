@@ -5,6 +5,13 @@ def poll_ui(group_code: str, user_name: str):
     st.subheader("🗳️ Dish Polls & Suggestions")
     st.caption("Suggest new dishes to add to the family rotation. Suggestions are auto-promoted once they reach majority approval.")
 
+    # Keep one-time confirmations visible after the rerun used to refresh vote
+    # counts. Rendering st.success() immediately before st.rerun() discards the
+    # message before the user can see it.
+    poll_notice = st.session_state.pop("poll_notice", None)
+    if poll_notice:
+        st.success(poll_notice)
+
     # ------------------------------------------------
     # SUGGEST NEW DISH
     # ------------------------------------------------
@@ -85,10 +92,10 @@ def poll_ui(group_code: str, user_name: str):
                             ok = False
                             st.error(f"Voting failed: {e}")
                         if ok:
-                            st.success(f"Vote registered for {dish}!")
+                            st.session_state["poll_notice"] = f"Vote registered for {dish}!"
+                            st.rerun()
                         else:
                             st.error(f"Could not register vote for {dish}. Please try again.")
-                        st.rerun()
                             
                 with col_metric:
                     st.caption(f"Status: {'✅ Promoted!' if votes >= majority_needed else '⏳ Pending votes...'}")

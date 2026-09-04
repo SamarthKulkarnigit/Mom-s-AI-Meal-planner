@@ -15,10 +15,13 @@ Regression tests for the Polls "Approve / Cast Vote" flow:
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+APP_PATH = Path(__file__).resolve().parents[1] / "main.py"
 
 import db  # noqa: E402
 from backend.database import SessionLocal  # noqa: E402
@@ -190,7 +193,7 @@ def test_approve_vote_button_persists_vote():
 
     # Run the real app logged in, then navigate to the Polls page. The API is
     # not running, but api_client degrades gracefully to None (handled by UI).
-    at = AppTest.from_file("main.py", default_timeout=30)
+    at = AppTest.from_file(APP_PATH, default_timeout=30)
     at.session_state["logged_in"] = True
     at.session_state["group_code"] = code
     at.session_state["user_name"] = "poll_ui_alice"

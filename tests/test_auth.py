@@ -27,11 +27,14 @@ Streamlit UI (AppTest + mocked api_client, no network):
 import os
 import sys
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+APP_PATH = Path(__file__).resolve().parents[1] / "main.py"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -275,7 +278,7 @@ def _fake_ui(monkeypatch, login_resp=None, join_resp=None):
     monkeypatch.setattr(api_client, "get_home_stats", lambda *a, **k: _Resp(200, EMPTY_STATS))
 
     from streamlit.testing.v1 import AppTest
-    at = AppTest.from_file("main.py", default_timeout=30)
+    at = AppTest.from_file(APP_PATH, default_timeout=30)
     at.run()
     return at
 
