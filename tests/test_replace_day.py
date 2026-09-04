@@ -342,6 +342,12 @@ def test_replace_no_candidate_available_returns_422(client):
     # A family with exactly 7 dishes: every dish is already scheduled this week,
     # so after exclusion there is nothing left to replace with.
     code, token = _create_family(client, "nocands")
+    s = SessionLocal()
+    try:
+        s.query(m.Dish).filter(m.Dish.group_code == code).delete()
+        s.commit()
+    finally:
+        s.close()
     _add_dishes(code, names=DISH_NAMES[:7])
     _generate_plan(client, code, token)
 

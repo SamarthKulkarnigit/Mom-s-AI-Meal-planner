@@ -16,6 +16,8 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from jose import JWTError, jwt
 import bcrypt
@@ -26,6 +28,7 @@ import logging
 import time
 import sys
 import os
+import re
 
 from .database import engine, Base, get_db, run_schema_migrations
 from . import models
@@ -42,6 +45,8 @@ run_schema_migrations()  # additive, idempotent; no-op on fresh databases
 # set in every real deployment (see .env.example).
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
+    if os.getenv("ENVIRONMENT", "").lower() == "production":
+        raise RuntimeError("SECRET_KEY must be set when ENVIRONMENT=production")
     SECRET_KEY = secrets.token_urlsafe(48)
     logger.warning(
         "SECRET_KEY is not set — generated an ephemeral random signing key. "
@@ -121,11 +126,24 @@ class ReplaceDayRequest(BaseModel):
     day: str
 
 
+STARTER_DISHES = [
+    "Rajma Chawal", "Palak Paneer", "Masala Dosa", "Idli Sambar",
+    "Vegetable Khichdi", "Chole Bhature", "Pav Bhaji", "Dhokla",
+    "Veg Hakka Noodles", "Vegetable Pulao", "Pasta Arrabiata",
+    "Veg Quesadilla", "Tomato Soup", "Aloo Paratha",
+]
+
+
 # ─── Core routes ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("HEALTH: database check failed")
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"status": "ok", "database": "ok"}
 
 
 @app.post("/create_family")
@@ -137,10 +155,19 @@ def create_family(request: CreateFamilyRequest, db: Session = Depends(get_db)):
     while db.query(models.Group).filter(models.Group.group_code == code).first():
         code = generate_group_code()
 
-    db.add(models.Group(group_code=code, family_name=request.family_name, creator=request.creator_name))
-    db.commit()
-    db.add(models.User(username=request.creator_name, hashed_password=hash_password(request.password), group_code=code))
-    db.commit()
+    try:
+        db.add(models.Group(group_code=code, family_name=request.family_name, creator=request.creator_name))
+        db.add(models.User(username=request.creator_name, hashed_password=hash_password(request.password), group_code=code))
+        for dish_name in STARTER_DISHES:
+            db.add(models.Dish(group_code=code, name=dish_name, source="Starter"))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Could not create family with those details")
+    except Exception:
+        db.rollback()
+        logger.exception("CREATE_FAMILY: transaction failed")
+        raise HTTPException(status_code=500, detail="Could not create family")
     return {"group_code": code, "message": "Family created successfully"}
 
 
@@ -329,9 +356,7 @@ def _validate_llm_plan(
             raise ValueError(f"Entry {i} dish_id={dish_id} appears more than once")
         seen_dish_ids.add(dish_id)
 
-        reason = str(entry.get("reason", "")).strip()
-        if len(reason) < 5:
-            raise ValueError(f"Entry {i} reason is too short: '{reason}'")
+        reason = _validate_grounded_reason(entry.get("reason"), f"Entry {i} reason")
 
         validated.append({"day": day, "dish_id": dish_id, "reason": reason})
 
@@ -339,6 +364,27 @@ def _validate_llm_plan(
         raise ValueError("Plan does not cover all 7 days of the week")
 
     return validated
+
+
+_UNSUPPORTED_REASON_TERMS = re.compile(
+    r"\b(calorie|protein|vitamin|nutritious|healthy|health|cure|allerg|diabet|"
+    r"favorite|favourite|loves?|hates?|previously served|ate last)\w*\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_grounded_reason(value, label: str = "Reason") -> str:
+    """Reject the highest-risk unsupported claims without pretending to do NLP."""
+    reason = str(value or "").strip()
+    if len(reason) < 5:
+        raise ValueError(f"{label} is too short")
+    if len(reason) > 240:
+        raise ValueError(f"{label} is too long")
+    if re.search(r"\d", reason):
+        raise ValueError(f"{label} contains an unsupported numeric claim")
+    if _UNSUPPORTED_REASON_TERMS.search(reason):
+        raise ValueError(f"{label} contains an unsupported factual claim")
+    return reason
 
 
 def _fallback_plan_entries(group_code: str, db: Session) -> List[dict]:
@@ -350,8 +396,9 @@ def _fallback_plan_entries(group_code: str, db: Session) -> List[dict]:
     try:
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from ml_recommender import generate_weekly_plan_for_group
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail=f"ML recommender unavailable: {exc}")
+    except ImportError:
+        logger.exception("FALLBACK: ML recommender unavailable")
+        raise HTTPException(status_code=503, detail="Recommendation engine unavailable")
 
     plan_df = generate_weekly_plan_for_group(group_code)
     if plan_df is None or plan_df.empty:
@@ -459,9 +506,9 @@ def generate_schedule(
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from ml_recommender import get_candidates_for_group
         candidates = get_candidates_for_group(group_code, n_candidates=14)
-    except Exception as exc:
-        logger.error("SCHEDULE/GENERATE: candidate generation error: %s", exc)
-        raise HTTPException(status_code=503, detail=f"Recommendation engine error: {exc}")
+    except Exception:
+        logger.exception("SCHEDULE/GENERATE: candidate generation failed")
+        raise HTTPException(status_code=503, detail="Recommendation engine unavailable")
 
     logger.info("SCHEDULE/GENERATE: candidates ready in %.2fs (n=%d)", time.time() - t0, len(candidates))
 
@@ -521,8 +568,8 @@ def generate_schedule(
 
     except Exception as exc:
         logger.warning(
-            "SCHEDULE/GENERATE: AI path failed (%s: %s) — using ML fallback",
-            type(exc).__name__, exc,
+            "SCHEDULE/GENERATE: AI path failed (%s) — using ML fallback",
+            type(exc).__name__,
         )
         ai_generated = False
         fallback_reason = str(exc)
@@ -667,9 +714,9 @@ def replace_schedule_day(
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from ml_recommender import get_candidates_for_group
         candidates = get_candidates_for_group(group_code, n_candidates=14)
-    except Exception as exc:
-        logger.error("SCHEDULE/REPLACE: candidate generation error: %s", exc)
-        raise HTTPException(status_code=503, detail=f"Recommendation engine error: {exc}")
+    except Exception:
+        logger.exception("SCHEDULE/REPLACE: candidate generation failed")
+        raise HTTPException(status_code=503, detail="Recommendation engine unavailable")
 
     eligible = [c for c in candidates if c["dish_id"] not in used_dish_ids]
     if not eligible:
@@ -720,17 +767,15 @@ def replace_schedule_day(
         if candidate_dish_id in used_dish_ids:
             raise ValueError(f"dish_id={candidate_dish_id} is already scheduled this week")
 
-        candidate_reason = str(raw.get("reason", "")).strip()
-        if len(candidate_reason) < 5:
-            raise ValueError("reason is too short")
+        candidate_reason = _validate_grounded_reason(raw.get("reason"), "Gemini reason")
 
         dish_id = candidate_dish_id
         reason = candidate_reason
 
     except Exception as exc:
         logger.warning(
-            "SCHEDULE/REPLACE: AI path failed (%s: %s) — using ML fallback",
-            type(exc).__name__, exc,
+            "SCHEDULE/REPLACE: AI path failed (%s) — using ML fallback",
+            type(exc).__name__,
         )
         ai_generated = False
         fallback_reason = str(exc)

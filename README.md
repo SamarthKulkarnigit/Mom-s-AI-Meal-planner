@@ -16,16 +16,20 @@ By incorporating family preferences, suggestions, polls, and historical ratings,
 
 The application is modularized to separate the frontend UI from the backend business logic and data persistence layer.
 
-```
-[ Frontend (Streamlit) ]
-         |
-    (db.py / api_client.py)
-         |
-         v
-[ Backend API (FastAPI) & SQLAlchemy ]
-         |
-         v
-[ Unified Data Layer (SQLite / PostgreSQL) ]
+```mermaid
+flowchart TD
+    U[Family member] --> S[Streamlit frontend]
+    S -->|JWT: auth, stats, plan generation, replacement| A[FastAPI backend]
+    S -->|JWT revalidated via /me before trusted compatibility reads/writes| D[SQLAlchemy compatibility layer]
+    A --> R[Hybrid recommendation engine]
+    R --> C[Grounded candidate set]
+    C --> G[Gemini planning and explanations]
+    G --> V[Backend validation]
+    V --> P[(PostgreSQL / SQLite)]
+    A --> P
+    D --> P
+    V -. failure .-> F[Deterministic fallback]
+    F --> P
 ```
 
 ### Tech Stack
@@ -74,7 +78,9 @@ For production (PostgreSQL):
 ```bash
 export DATABASE_URL="postgresql://user:password@host:port/dbname"
 ```
-Ensure `SECRET_KEY` is also set in the `.env` file for secure session management.
+Copy `.env.example` and set the values in your shell or deployment secret manager.
+Never commit real credentials. When `ENVIRONMENT=production`, `SECRET_KEY` is
+required and startup fails safely if it is absent.
 
 ### 4. Data Migration (Important for Phase 1)
 If you have legacy CSV data in the `data/` folder, migrate it to the new SQL database using the migration utility:
@@ -96,20 +102,49 @@ PYTHONPATH=. streamlit run main.py
 ```
 The application will be accessible at `http://localhost:8501`.
 
-## Screenshots
-> *Placeholder for application screenshots (e.g., Home Dashboard, Scheduler, Analytics).*
+## Production deployment
+
+Use one Aiven PostgreSQL database for both services during this shipping phase.
+The Streamlit process still contains a server-side SQLAlchemy compatibility
+layer, so its `DATABASE_URL` must exactly match Render's `DATABASE_URL`.
+
+### Render backend
+
+1. Create a Python web service from this repository.
+2. Set the start command:
+   `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`
+3. Set `ENVIRONMENT=production`, `DATABASE_URL`, `SECRET_KEY`,
+   `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.6-flash`, and
+   `GEMINI_TIMEOUT_MS=60000` as secret environment variables.
+4. Verify `https://<render-service>/health` returns
+   `{"status":"ok","database":"ok"}`.
+
+### Streamlit Community Cloud frontend
+
+1. Deploy `main.py` from this repository.
+2. Add `API_URL=https://<render-service>` and the same Aiven `DATABASE_URL`
+   using Streamlit secrets/environment configuration.
+3. Start command: `streamlit run main.py` (Community Cloud invokes this for
+   the selected entrypoint).
+
+### Submission smoke test
+
+Create a family, generate a seven-day plan, replace one day, submit feedback,
+open analytics, regenerate, then temporarily remove `GEMINI_API_KEY` from a
+non-production test instance and confirm the deterministic fallback succeeds.
 
 ## Design Decisions
 - **Unified Persistence Layer**: All data (Users, Groups, Dishes, Ratings, Polls, Schedules) has been migrated from CSVs to a cloud-ready SQL database using SQLAlchemy. `db.py` acts as a compatibility wrapper that directly queries the database and returns Pandas DataFrames, preventing unnecessary rewrites of the ML algorithms or UI components.
-- **API Layer**: An API layer was introduced so the Streamlit frontend remains stateless and can easily be replaced or supplemented by mobile clients in the future.
+- **API Layer**: Authentication and schedule mutations use FastAPI. Remaining
+  legacy UI data access stays server-side through `db.py` and is gated by JWT
+  revalidation on every authenticated Streamlit rerun.
 - **A-Res Sampling**: Chosen for the recommendation engine to provide a mathematically sound way of randomizing selections while still strongly favoring highly-rated dishes.
 
-## Future Improvements
-- **Production Database**: Migrate all CSV data to PostgreSQL/SQLite for better concurrency and integrity.
-- **Docker/Containerization**: Containerize the frontend and backend using `docker-compose` for easier deployment.
-- **Deployment**: Deploy on cloud providers (e.g., AWS, Render, Heroku).
-- **Nutrition-Aware Recommendations**: Integrate a nutritional API to balance macros in the weekly schedule.
-- **Grocery List Generation**: Automatically generate grocery lists based on the scheduled meals.
+## Post-submission maintenance
+
+- Move the remaining server-side `db.py` compatibility calls behind FastAPI.
+- Replace additive startup migrations with a versioned migration tool.
+- Preserve immutable rating events for more rigorous longitudinal analytics.
 
 ## Project Status
 This is a personal/student project created by Samarth Kulkarni.

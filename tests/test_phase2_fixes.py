@@ -434,10 +434,38 @@ def test_schedule_reason_persists_through_save_data(client):
 
 def test_generate_without_enough_dishes_returns_422(client):
     code, token = _create_family(client, "creator_short")
+    s = SessionLocal()
+    try:
+        s.query(m.Dish).filter(m.Dish.group_code == code).delete()
+        s.commit()
+    finally:
+        s.close()
     resp = client.post(f"/group/{code}/schedule/generate", headers=_auth(token))
     assert resp.status_code == 422
     rows, _ = _rows_for(code)
     assert rows == []
+
+
+def test_fresh_family_has_isolated_starter_dishes_and_can_generate(client):
+    code, token = _create_family(client, "fresh_demo_family")
+    other_code, _ = _create_family(client, "other_demo_family")
+
+    s = SessionLocal()
+    try:
+        dishes = s.query(m.Dish).filter(m.Dish.group_code == code).all()
+        other_ids = {d.id for d in s.query(m.Dish).filter(m.Dish.group_code == other_code).all()}
+    finally:
+        s.close()
+
+    assert len(dishes) >= 7
+    assert len({d.name.lower() for d in dishes}) == len(dishes)
+    assert not ({d.id for d in dishes} & other_ids)
+
+    with patch("backend.llm_service.generate_weekly_plan", side_effect=RuntimeError("offline")):
+        resp = client.post(f"/group/{code}/schedule/generate", headers=_auth(token))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["fallback_used"] is True
+    assert len(resp.json()["schedule"]) == 7
 
 
 # --------------------------------------------------------------------------- #

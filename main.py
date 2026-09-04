@@ -188,6 +188,24 @@ if not st.session_state.logged_in:
                 st.error("Please fill in both username and password.")
     st.stop()
 
+# Revalidate the Streamlit session before any page uses the direct SQLAlchemy
+# compatibility layer. /me is authoritative for identity and family scope.
+identity_resp = api_client.get_me()
+if identity_resp is None:
+    st.error("The backend is temporarily unavailable. Please try again shortly.")
+    st.stop()
+if identity_resp.status_code != 200:
+    st.session_state.logged_in = False
+    st.session_state.token = ""
+    st.session_state.pop("user_name", None)
+    st.session_state.pop("group_code", None)
+    st.error("Your session has expired. Please log in again.")
+    st.stop()
+
+identity = identity_resp.json()
+st.session_state.user_name = identity["username"]
+st.session_state.group_code = identity["group_code"]
+
 # -----------------------------------
 # SESSION VARIABLES
 # -----------------------------------
@@ -401,6 +419,5 @@ elif page == "📊 Analytics":
     analytics_ui(
         group_code
     )
-
 
 

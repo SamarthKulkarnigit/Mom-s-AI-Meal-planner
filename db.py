@@ -359,6 +359,32 @@ def get_group_members_count(group_code: str) -> int:
     finally:
         db.close()
 
+def is_group_member(group_code: str, user_name: str, session: Session = None) -> bool:
+    """Return whether a named person belongs to the requested family."""
+    own_session = session is None
+    sess = session or SessionLocal()
+    try:
+        user = sess.query(models.User).filter(
+            models.User.group_code == group_code,
+            models.User.username == str(user_name).strip(),
+        ).first()
+        if user:
+            return True
+        if sess.query(models.User).filter(models.User.group_code == group_code).count() == 0:
+            member_count = sess.query(models.Member).filter(models.Member.group_code == group_code).count()
+            if member_count == 0:
+                # Compatibility for isolated data-import/recommender fixtures.
+                # Public API-created families always have a registered User.
+                return True
+            return sess.query(models.Member).filter(
+                models.Member.group_code == group_code,
+                models.Member.name == str(user_name).strip(),
+            ).first() is not None
+        return False
+    finally:
+        if own_session:
+            sess.close()
+
 # -----------------------------------
 # DISH FUNCTIONS
 # -----------------------------------
@@ -393,6 +419,8 @@ def get_dishes(group_code: str):
 def suggest_dish(group_code: str, dish: str, suggester: str) -> bool:
     db = SessionLocal()
     try:
+        if not is_group_member(group_code, suggester, db):
+            return False
         dish_clean = str(dish).strip()
         existing = db.query(models.PendingSuggestion).filter(models.PendingSuggestion.group_code == group_code, models.PendingSuggestion.dish_name == dish_clean).first()
         if not existing:
@@ -425,6 +453,9 @@ def vote_dish(group_code: str, dish: str, user: str) -> bool:
     try:
         dish_clean = str(dish).strip()
         user_clean = str(user).strip()
+
+        if not is_group_member(group_code, user_clean, db):
+            return False
 
         dish_obj = db.query(models.Dish).filter(
             models.Dish.group_code == group_code, models.Dish.name == dish_clean
@@ -500,11 +531,13 @@ def _maybe_promote_pending_if_majority(group_code: str, dish: str, db: Session =
 # -----------------------------------
 # RATING FUNCTIONS
 # -----------------------------------
-def rate_dish(group_code: str, dish: str, rating: float, user_name: str = "", week: Optional[int] = None, overwrite: bool = True):
+def rate_dish(group_code: str, dish: str, rating: float, user_name: str = "", week: Optional[int] = None, overwrite: bool = True, day: Optional[str] = None, comment: Optional[str] = None):
     db = SessionLocal()
     try:
         dish_clean = str(dish).strip()
         user_clean = str(user_name).strip()
+        if not is_group_member(group_code, user_clean, db):
+            return False
         dish_obj = db.query(models.Dish).filter(models.Dish.group_code == group_code, models.Dish.name == dish_clean).first()
         if not dish_obj: return False
         
@@ -516,8 +549,10 @@ def rate_dish(group_code: str, dish: str, rating: float, user_name: str = "", we
                 # member's repeated preference instead of replacing it.
                 existing.rating = round(RATING_EMA_BETA * fresh + (1.0 - RATING_EMA_BETA) * float(existing.rating), 2)
                 existing.week = int(week) if week else existing.week
+                existing.day = day or existing.day
+                existing.comment = comment
             else:
-                r = models.Rating(group_code=group_code, dish_id=dish_obj.id, user_name=user_clean, rating=fresh, week=int(week) if week else 1)
+                r = models.Rating(group_code=group_code, dish_id=dish_obj.id, user_name=user_clean, rating=fresh, week=int(week) if week else 1, day=day, comment=comment)
                 db.add(r)
         else:
             r = models.Rating(group_code=group_code, dish_id=dish_obj.id, user_name=user_clean, rating=float(rating), week=int(week) if week else 1)

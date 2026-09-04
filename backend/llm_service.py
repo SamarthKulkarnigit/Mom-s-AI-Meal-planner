@@ -31,7 +31,8 @@ DEFAULT_TIMEOUT_MS = 60_000  # bounded request so hangs trigger the caller's fal
 
 def _timeout_ms() -> int:
     try:
-        return int(os.getenv("GEMINI_TIMEOUT_MS", str(DEFAULT_TIMEOUT_MS)).strip())
+        value = int(os.getenv("GEMINI_TIMEOUT_MS", str(DEFAULT_TIMEOUT_MS)).strip())
+        return min(120_000, max(1_000, value))
     except ValueError:
         return DEFAULT_TIMEOUT_MS
 

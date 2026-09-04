@@ -5,6 +5,14 @@ import requests
 # Environment-driven backend URL. Localhost is only the development fallback;
 # production deployments set API_URL to the deployed FastAPI service (Render).
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+CONNECT_TIMEOUT_SECONDS = 5
+
+try:
+    _gemini_timeout_ms = int(os.getenv("GEMINI_TIMEOUT_MS", "60000"))
+except ValueError:
+    _gemini_timeout_ms = 60000
+READ_TIMEOUT_SECONDS = max(15, min(130, _gemini_timeout_ms // 1000 + 10))
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS)
 
 def get_headers():
     headers = {}
@@ -14,14 +22,16 @@ def get_headers():
 
 def _safe_get(url, **kwargs):
     try:
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         return requests.get(url, **kwargs)
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.RequestException:
         return None
 
 def _safe_post(url, **kwargs):
     try:
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         return requests.post(url, **kwargs)
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.RequestException:
         return None
 
 def create_family(family_name, creator_name, password):
@@ -79,4 +89,3 @@ def replace_day(group_code: str, week: int, day: str):
         headers=get_headers(),
         json={"week": int(week), "day": day},
     )
-

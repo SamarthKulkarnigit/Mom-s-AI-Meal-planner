@@ -185,11 +185,16 @@ def test_voting_existing_rotation_dish_still_works():
 # Streamlit UI button end-to-end
 # --------------------------------------------------------------------------- #
 
-def test_approve_vote_button_persists_vote():
+def test_approve_vote_button_persists_vote(monkeypatch):
     from streamlit.testing.v1 import AppTest
+    import api_client
 
     code = _make_group("poll_ui_alice", other_users=("poll_ui_bob",))
     assert db.suggest_dish(code, "Veg Biryani", "poll_ui_alice") is True
+    monkeypatch.setattr(api_client, "get_me", lambda: type("Resp", (), {
+        "status_code": 200,
+        "json": lambda self: {"username": "poll_ui_alice", "group_code": code},
+    })())
 
     # Run the real app logged in, then navigate to the Polls page. The API is
     # not running, but api_client degrades gracefully to None (handled by UI).

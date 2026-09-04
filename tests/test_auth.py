@@ -276,6 +276,8 @@ def _fake_ui(monkeypatch, login_resp=None, join_resp=None):
     monkeypatch.setattr(api_client, "join_family", lambda *a, **k: join_resp if join_resp is not None else _Resp(200, {"message": "Joined family successfully"}))
     monkeypatch.setattr(api_client, "get_members", lambda *a, **k: _Resp(200, []))
     monkeypatch.setattr(api_client, "get_home_stats", lambda *a, **k: _Resp(200, EMPTY_STATS))
+    identity_group = (login_resp.json().get("group_code") if login_resp and login_resp.status_code == 200 else "ABC123")
+    monkeypatch.setattr(api_client, "get_me", lambda *a, **k: _Resp(200, {"username": "mom", "group_code": identity_group}))
 
     from streamlit.testing.v1 import AppTest
     at = AppTest.from_file(APP_PATH, default_timeout=30)

@@ -117,27 +117,12 @@ def daily_feedback_ui(group_code, user_name):
             "comment": comment
         }])
 
-        old_ratings = db.load_data(f"ratings_{group_code}.csv")
-
-        if old_ratings is None or old_ratings.empty:
-            updated = new_row
+        saved = db.rate_dish(
+            group_code, today_dish, rating, user_name=user_name,
+            week=int(current_week), day=today, comment=comment, overwrite=True,
+        )
+        if saved:
+            st.success("🎉 Feedback submitted successfully!")
+            st.balloons()
         else:
-            # Safe comparison to filter out previous feedback
-            old_ratings.columns = [str(c).strip().lower() for c in old_ratings.columns]
-            old_ratings["week_num"] = pd.to_numeric(old_ratings["week"], errors="coerce")
-            
-            mask = ~(
-                (old_ratings["user"].astype(str).str.strip().str.lower() == user_name.lower()) &
-                (old_ratings["dish"].astype(str).str.strip().str.lower() == today_dish.lower()) &
-                (old_ratings["week_num"] == int(current_week)) &
-                (old_ratings["day"].astype(str).str.strip().str.lower() == today.lower())
-            )
-            old_ratings = old_ratings[mask].copy()
-            if "week_num" in old_ratings.columns:
-                old_ratings = old_ratings.drop(columns=["week_num"])
-            
-            updated = pd.concat([old_ratings, new_row], ignore_index=True)
-
-        db.save_data(updated, f"ratings_{group_code}.csv")
-        st.success("🎉 Feedback submitted successfully!")
-        st.balloons()
+            st.error("Could not save feedback. Please refresh and try again.")
